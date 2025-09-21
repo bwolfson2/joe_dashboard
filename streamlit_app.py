@@ -62,7 +62,9 @@ def load_and_process_data():
         return pd.DataFrame()
 
     df = pd.concat(dfs, ignore_index=True)
-    
+
+    # Keep all records to show all members, but we'll group by organization later
+
     # Clean and process key fields
     df['doctor_count'] = pd.to_numeric(df['doctor_count'], errors='coerce').fillna(0).astype(int)
     df['phone_clean'] = df['Authorized Official Telephone Number'].astype(str).str.replace('.0', '').str.strip()
@@ -73,8 +75,13 @@ def load_and_process_data():
     df['has_email'] = df['email'] != ''
     
     # Create full contact name
-    df['contact_full_name'] = (df['Authorized Official First Name'].fillna('') + ' ' + 
+    df['contact_full_name'] = (df['Authorized Official First Name'].fillna('') + ' ' +
                                 df['Authorized Official Last Name'].fillna('')).str.strip()
+
+    # Create provider name (individual doctor)
+    df['provider_full_name'] = (df['Provider First Name'].fillna('') + ' ' +
+                                df['Provider Last Name (Legal Name)'].fillna('')).str.strip()
+    df['is_individual_provider'] = df['provider_full_name'] != ''
     
     # Process addresses - use address_group which contains both addresses
     df['full_address'] = df['address_group'].fillna('')
@@ -290,20 +297,42 @@ def main():
     with tab1:
         st.header("High-Value Sales Targets")
         st.markdown("Organizations with complete contact information and highest sales potential")
-        
-        # Get top leads
-        top_leads = filtered_df.nlargest(30, 'lead_score')
-        
+
+        # Group by organization and get aggregated info
+        org_groups = filtered_df.groupby('agreed_upon_name').agg({
+            'lead_score': 'first',
+            'doctor_count': 'first',
+            'org_size_category': 'first',
+            'has_email': 'max',
+            'has_phone': 'max',
+            'state_clean': 'first',
+            'city_clean': 'first',
+            'phone_clean': 'first',
+            'email': 'first',
+            'contact_full_name': 'first',
+            'Authorized Official Title or Position': 'first',
+            'practice_address': 'first',
+            'mailing_address': 'first',
+            'full_address': 'first',
+            'affiliation_address': 'first',
+            'Classification_1': 'first',
+            'Is Sole Proprietor': 'first',
+            'NPI': 'first'
+        }).reset_index()
+
+        # Sort by lead score and doctor count
+        org_groups = org_groups.sort_values(['lead_score', 'doctor_count'], ascending=False).head(30)
+
         # Create two columns for lead cards
         col1, col2 = st.columns(2)
-        
-        for idx, (_, lead) in enumerate(top_leads.iterrows()):
+
+        for idx, (_, lead) in enumerate(org_groups.iterrows()):
             with col1 if idx % 2 == 0 else col2:
                 score_color = "🟢" if lead['lead_score'] >= 10 else "🟡" if lead['lead_score'] >= 7 else "🔵"
                 email_icon = "📧" if lead['has_email'] else ""
                 phone_icon = "📱" if lead['has_phone'] else ""
                 
-                with st.expander(f"{score_color} **{lead['agreed_upon_name'][:50]}** (Score: {lead['lead_score']}/13) {email_icon}{phone_icon}"):
+                with st.expander(f"{score_color} **{lead['agreed_upon_name'][:50]}** (Score: {lead['lead_score']}/13 | {lead['doctor_count']} doctors) {email_icon}{phone_icon}"):
                     # Organization info
                     st.markdown("### 🏥 Organization Details")
                     col_a, col_b = st.columns(2)
@@ -353,6 +382,62 @@ def main():
                             st.write("**All Locations:**")
                             for addr in lead['full_address'].split('|'):
                                 st.write(f"  • {addr.strip()}")
+
+                    # Show all members/providers in this organization
+                    org_members = filtered_df[filtered_df['agreed_upon_name'] == lead['agreed_upon_name']]
+                    if len(org_members) > 0:
+                        st.markdown("### 👥 Organization Members")
+
+                        # Show individual providers
+                        providers = org_members[org_members['is_individual_provider']]['provider_full_name'].unique()
+                        providers = [p for p in providers if p]  # Filter out empty names
+
+                        if providers:
+                            st.write(f"**Providers ({len(providers)}):**")
+                            # Show all providers with contact info where available
+                            for provider_name in providers[:20]:
+                                # Get the row for this provider
+                                provider_rows = org_members[org_members['provider_full_name'] == provider_name]
+                                if not provider_rows.empty:
+                                    provider_row = provider_rows.iloc[0]
+                                    phone = provider_row.get('phone_clean', '')
+                                    email = provider_row.get('email', '')
+
+                                    provider_info = f"  • {provider_name}"
+                                    if phone and phone != 'nan' and len(str(phone)) > 5:
+                                        provider_info += f" | 📞 {format_phone(str(phone))}"
+                                    if email and email != '':
+                                        provider_info += f" | 📧 {email}"
+
+                                    st.write(provider_info)
+                                else:
+                                    st.write(f"  • {provider_name}")
+                            if len(providers) > 20:
+                                st.write(f"  _...and {len(providers) - 20} more providers_")
+
+                        # Show other decision makers/contacts
+                        other_contacts = org_members[~org_members['contact_full_name'].isin(['', lead['contact_full_name']])]['contact_full_name'].unique()
+                        other_contacts = [c for c in other_contacts if c]  # Filter out empty names
+
+                        if other_contacts:
+                            st.write(f"**Other Contacts ({len(other_contacts)}):**")
+                            for contact in other_contacts[:10]:
+                                contact_row = org_members[org_members['contact_full_name'] == contact].iloc[0]
+                                title = contact_row.get('Authorized Official Title or Position', '')
+                                phone = contact_row.get('phone_clean', '')
+                                email = contact_row.get('email', '')
+
+                                contact_info = f"  • {contact}"
+                                if title and title != 'nan':
+                                    contact_info += f" - {title}"
+                                if phone and phone != 'nan' and len(str(phone)) > 5:
+                                    contact_info += f" | 📞 {format_phone(str(phone))}"
+                                if email and email != '':
+                                    contact_info += f" | 📧 {email}"
+
+                                st.write(contact_info)
+                            if len(other_contacts) > 10:
+                                st.write(f"  _...and {len(other_contacts) - 10} more contacts_")
     
     with tab2:
         st.header("Organization Size Analysis")
