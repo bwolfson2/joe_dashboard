@@ -175,10 +175,13 @@ def main():
         # Organization size filter
         st.subheader("Organization Size")
         size_categories = df['org_size_category'].unique()
+        # Only set defaults that exist in the data
+        default_sizes = [size for size in ["Enterprise (50+ doctors)", "Large (20-49 doctors)", "Medium (10-19 doctors)"]
+                        if size in size_categories]
         selected_sizes = st.multiselect(
             "Select organization sizes:",
             sorted(size_categories),
-            default=["Enterprise (50+ doctors)", "Large (20-49 doctors)", "Medium (10-19 doctors)"]
+            default=default_sizes if default_sizes else sorted(size_categories)[:3] if len(size_categories) >= 3 else sorted(size_categories)
         )
         
         # State filter
