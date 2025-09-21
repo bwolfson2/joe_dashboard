@@ -1,0 +1,12 @@
+*.pyc
+__pycache__
+.DS_Store
+.git
+.gitignore
+*.md
+.venv
+env/
+venv/
+.env
+dashboard_data.json
+*.log
