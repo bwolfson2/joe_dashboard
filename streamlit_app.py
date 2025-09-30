@@ -321,7 +321,7 @@ def main():
         }).reset_index()
 
         # Sort by lead score and doctor count
-        org_groups = org_groups.sort_values(['lead_score', 'doctor_count'], ascending=False).head(30)
+        org_groups = org_groups.sort_values(['lead_score', 'doctor_count'], ascending=False)
 
         # Create two columns for lead cards
         col1, col2 = st.columns(2)
@@ -621,7 +621,7 @@ def main():
             display_df = display_df[display_df['Phone'] != 'nan']
         
         st.dataframe(
-            display_df.head(500),
+            display_df,
             use_container_width=True,
             height=600,
             column_config={
@@ -632,8 +632,8 @@ def main():
                 "Address": st.column_config.TextColumn("Address", width="large"),
             }
         )
-        
-        st.info(f"Showing top 500 of {len(display_df):,} filtered leads")
+
+        st.info(f"Showing all {len(display_df):,} filtered leads")
     
     with tab5:
         st.header("Export Contact List")
