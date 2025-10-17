@@ -1,2 +1,29 @@
+# Old data files
 contact_info_for_joe.csv
+contact_info_*.csv
+
+# Large CMS data files
+DAC_NationalDownloadableFile.csv  # Original 672MB CSV
+DAC_NationalDownloadableFile.parquet  # Full 208MB parquet
+DAC_chunk_*.csv  # CSV chunks (replaced with parquet)
+
+# Email agent cache and results
+email_cache.json
+email_discoveries.csv
+
+# Environment variables
+.env
+
+# Data directory
 data/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+
+# Streamlit cache
+.streamlit/

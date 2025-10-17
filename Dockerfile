@@ -17,11 +17,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application files
 COPY streamlit_app.py .
-COPY generate_dashboard.py .
-COPY contact_info_1.csv .
-COPY contact_info_2.csv .
-COPY contact_info_3.csv .
-COPY contact_info_4.csv .
+COPY email_agent.py .
+
+# Copy the 3 parquet data files (each ~70MB, 70% smaller than CSV)
+COPY DAC_parquet_1.parquet .
+COPY DAC_parquet_2.parquet .
+COPY DAC_parquet_3.parquet .
 
 # Create data directory
 RUN mkdir -p /app/data

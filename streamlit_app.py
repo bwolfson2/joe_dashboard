@@ -6,7 +6,7 @@ from datetime import datetime
 
 # Page config
 st.set_page_config(
-    page_title="Healthcare Sales Lead Dashboard",
+    page_title="Healthcare Sales Lead Dashboard - CMS DAC Data",
     page_icon="🏥",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -50,168 +50,164 @@ st.markdown(
 
 @st.cache_data(ttl=3600)  # Cache for 1 hour
 def load_and_process_data():
-    """Load and process the healthcare provider data"""
-    # Load multiple CSV files and combine them
-    csv_files = [
-        "contact_info_1.csv",
-        "contact_info_2.csv",
-        "contact_info_3.csv",
-        "contact_info_4.csv",
-    ]
+    """Load and process the CMS DAC healthcare provider data from parquet chunks"""
+
+    # Load from 3 parquet files (70% smaller than CSV, faster loading)
+    parquet_files = [f"DAC_parquet_{i}.parquet" for i in range(1, 4)]
+
     dfs = []
-    for file in csv_files:
+    missing_files = []
+
+    for parquet_file in parquet_files:
         try:
-            # Use specific dtypes to reduce memory and speed up loading
-            df_part = pd.read_csv(file, low_memory=False,
-                                 dtype={'doctor_count': 'float32',
-                                       'Is Sole Proprietor': 'category'})
-            dfs.append(df_part)
+            chunk_df = pd.read_parquet(parquet_file)
+            dfs.append(chunk_df)
         except FileNotFoundError:
-            st.warning(f"File {file} not found, skipping...")
+            missing_files.append(parquet_file)
+
+    if missing_files:
+        st.error(f"Missing parquet files: {', '.join(missing_files)}")
+        st.info("Run the split script to create parquet chunks")
+        return pd.DataFrame()
 
     if not dfs:
         st.error("No data files found!")
         return pd.DataFrame()
 
+    # Combine all chunks
     df = pd.concat(dfs, ignore_index=True)
 
-    # Keep all records to show all members, but we'll group by organization later
-
     # Clean and process key fields
-    df["doctor_count"] = (
-        pd.to_numeric(df["doctor_count"], errors="coerce").fillna(0).astype(int)
-    )
-    df["phone_clean"] = (
-        df["Authorized Official Telephone Number"]
-        .astype(str)
-        .str.replace(".0", "")
-        .str.strip()
-    )
-    df["has_phone"] = df["phone_clean"].apply(
-        lambda x: x != "nan" and x != "" and len(x) > 5
+    df["num_org_mem"] = (
+        pd.to_numeric(df["num_org_mem"], errors="coerce").fillna(0).astype(int)
     )
 
-    # Extract email from cf_Endpoint field
-    df["email"] = df["cf_Endpoint"].apply(lambda x: str(x) if "@" in str(x) else "")
-    df["has_email"] = df["email"] != ""
+    # Clean phone numbers (they're loaded as floats in scientific notation)
+    def clean_phone(phone):
+        if pd.isna(phone):
+            return ""
+        # Convert float to int to string to avoid scientific notation
+        phone_str = str(int(phone)) if isinstance(phone, float) else str(phone)
+        # Remove any non-digits
+        phone_clean = ''.join(filter(str.isdigit, phone_str))
+        return phone_clean if len(phone_clean) == 10 else ""
 
-    # Create full contact name
-    df["contact_full_name"] = (
-        df["Authorized Official First Name"].fillna("")
-        + " "
-        + df["Authorized Official Last Name"].fillna("")
-    ).str.strip()
+    df["phone_clean"] = df["Telephone Number"].apply(clean_phone)
+    df["has_phone"] = df["phone_clean"].str.len() == 10
 
-    # Create provider name (individual doctor)
+    # For now, no emails in this dataset - we'll need the agent to find them
+    df["email"] = ""
+    df["has_email"] = False
+
+    # Create provider full name
     df["provider_full_name"] = (
         df["Provider First Name"].fillna("")
         + " "
-        + df["Provider Last Name (Legal Name)"].fillna("")
+        + df["Provider Last Name"].fillna("")
     ).str.strip()
-    df["is_individual_provider"] = df["provider_full_name"] != ""
 
-    # Process addresses - use address_group which contains both addresses
-    df["full_address"] = df["address_group"].fillna("")
-
-    # Also get individual address components
-    df["mailing_address"] = df["address_1"].fillna("")
-    df["practice_address"] = df["address_2"].fillna("")
+    # Create full address from components
+    df["full_address"] = (
+        df["adr_ln_1"].astype(str).replace("nan", "")
+        + ", "
+        + df["adr_ln_2"].astype(str).replace("nan", "")
+        + ", "
+        + df["City/Town"].astype(str).replace("nan", "")
+        + ", "
+        + df["State"].astype(str).replace("nan", "")
+        + " "
+        + df["ZIP Code"].astype(str).str.replace(".0", "").replace("nan", "")
+    ).str.replace(", , ", ", ").str.replace(", ,", ",").str.strip(", ")
 
     # Clean states and cities
-    df["state_clean"] = df[
-        "Provider Business Practice Location Address State Name"
-    ].fillna("Unknown")
-    df["city_clean"] = df[
-        "Provider Business Practice Location Address City Name"
-    ].fillna("Unknown")
-    df["mailing_city"] = df["Provider Business Mailing Address City Name"].fillna("")
-    df["mailing_state"] = df["Provider Business Mailing Address State Name"].fillna("")
+    df["state_clean"] = df["State"].astype(str).replace("nan", "Unknown")
+    df["city_clean"] = df["City/Town"].astype(str).replace("nan", "Unknown")
 
-    # Affiliation address if available
-    df["affiliation_address"] = (
-        (
-            df["cf_Affiliation Address Line One"].astype(str).replace("nan", "")
-            + " "
-            + df["cf_Affiliation Address Line Two"].astype(str).replace("nan", "")
-            + " "
-            + df["cf_Affiliation Address City"].astype(str).replace("nan", "")
-            + ", "
-            + df["cf_Affiliation Address State"].astype(str).replace("nan", "")
-            + " "
-            + df["cf_Affiliation Address Postal Code"].astype(str).replace("nan", "")
-        )
-        .str.strip()
-        .str.replace("  ", " ")
-        .str.strip(", ")
-    )
+    # Clean facility names
+    df["Facility Name"] = df["Facility Name"].astype(str).replace("nan", "Unknown Organization")
 
-    # Calculate organization size category using vectorized operations
+    # Clean specialties
+    df["pri_spec"] = df["pri_spec"].astype(str).replace("nan", "Unknown")
+    df["sec_spec_all"] = df["sec_spec_all"].astype(str).replace("nan", "")
+
+    # Credentials and education
+    df["Cred"] = df["Cred"].astype(str).str.strip().replace("nan", "")
+    df["Med_sch"] = df["Med_sch"].astype(str).replace("nan", "Unknown")
+    df["Grd_yr"] = pd.to_numeric(df["Grd_yr"], errors="coerce")
+
+    # Calculate organization size category
     df["org_size_category"] = pd.cut(
-        df["doctor_count"],
-        bins=[-1, 0, 4, 9, 19, 49, float('inf')],
-        labels=["Unknown", "Small Practice (1-4 doctors)", "Small Group (5-9 doctors)",
-                "Medium (10-19 doctors)", "Large (20-49 doctors)", "Enterprise (50+ doctors)"]
+        df["num_org_mem"],
+        bins=[-1, 0, 10, 50, 100, 300, 1000, float("inf")],
+        labels=[
+            "Unknown",
+            "Small Practice (1-10 members)",
+            "Medium (11-50 members)",
+            "Large (51-100 members)",
+            "Very Large (101-300 members)",
+            "Enterprise (301-1000 members)",
+            "Health System (1000+ members)",
+        ],
     )
 
     # Lead scoring based on sales criteria
     df["lead_score"] = 0
 
-    # Score based on doctor count (organization size)
-    df.loc[df["doctor_count"] >= 50, "lead_score"] += 5
-    df.loc[(df["doctor_count"] >= 20) & (df["doctor_count"] < 50), "lead_score"] += 4
-    df.loc[(df["doctor_count"] >= 10) & (df["doctor_count"] < 20), "lead_score"] += 3
-    df.loc[(df["doctor_count"] >= 5) & (df["doctor_count"] < 10), "lead_score"] += 2
-    df.loc[(df["doctor_count"] > 0) & (df["doctor_count"] < 5), "lead_score"] += 1
-
-    # Score for having leadership contact - vectorized
-    leadership_pattern = r'PRESIDENT|CEO|DIRECTOR|ADMINISTRATOR|MANAGER|OWNER|PARTNER|CHIEF'
-    df["is_leadership"] = (
-        df["Authorized Official Title or Position"]
-        .fillna('')
-        .str.upper()
-        .str.contains(leadership_pattern, regex=True, na=False)
-    )
-    df.loc[df["is_leadership"], "lead_score"] += 3
+    # Score based on organization member count
+    df.loc[df["num_org_mem"] >= 1000, "lead_score"] += 10
+    df.loc[(df["num_org_mem"] >= 300) & (df["num_org_mem"] < 1000), "lead_score"] += 8
+    df.loc[(df["num_org_mem"] >= 100) & (df["num_org_mem"] < 300), "lead_score"] += 6
+    df.loc[(df["num_org_mem"] >= 50) & (df["num_org_mem"] < 100), "lead_score"] += 4
+    df.loc[(df["num_org_mem"] >= 10) & (df["num_org_mem"] < 50), "lead_score"] += 2
+    df.loc[(df["num_org_mem"] > 0) & (df["num_org_mem"] < 10), "lead_score"] += 1
 
     # Score for having phone number
     df.loc[df["has_phone"], "lead_score"] += 2
 
-    # Score for having email
-    df.loc[df["has_email"], "lead_score"] += 2
+    # Score for group assignment (more valuable for sales)
+    df.loc[df["grp_assgn"] == "Y", "lead_score"] += 1
 
-    # Score for not being sole proprietor (larger organization)
-    df.loc[df["Is Sole Proprietor"] == "N", "lead_score"] += 1
+    # Score for telehealth capability
+    df.loc[df["Telehlth"].notna() & (df["Telehlth"].str.strip() != ""), "lead_score"] += 1
 
     return df
 
 
 @st.cache_data
-def filter_dataframe(df, selected_sizes, selected_states, only_leadership,
-                     only_with_phone, only_with_email, min_doctors, max_doctors):
+def filter_dataframe(
+    df,
+    selected_sizes,  # Kept for backwards compatibility but not used
+    selected_states,
+    selected_specialties,
+    only_with_phone,
+    min_members,
+    max_members,
+    only_group_practices,
+    only_telehealth,
+):
     """Cache filtered results for better performance"""
     filtered_df = df.copy()
 
-    if selected_sizes:
-        filtered_df = filtered_df[
-            filtered_df["org_size_category"].isin(selected_sizes)
-        ]
-    if selected_states:
-        filtered_df = filtered_df[filtered_df["state_clean"].isin(selected_states)]
-    if only_leadership:
-        filtered_df = filtered_df[filtered_df["is_leadership"]]
-    if only_with_phone:
-        filtered_df = filtered_df[filtered_df["has_phone"]]
-    if only_with_email:
-        filtered_df = filtered_df[filtered_df["has_email"]]
-
+    # Filter by member count first (most selective)
     filtered_df = filtered_df[
-        (filtered_df["doctor_count"] >= min_doctors) &
-        (filtered_df["doctor_count"] <= max_doctors)
+        (filtered_df["num_org_mem"] >= min_members)
+        & (filtered_df["num_org_mem"] <= max_members)
     ]
 
-    # Sort by lead score and doctor count
+    if selected_states:
+        filtered_df = filtered_df[filtered_df["state_clean"].isin(selected_states)]
+    if selected_specialties:
+        filtered_df = filtered_df[filtered_df["pri_spec"].isin(selected_specialties)]
+    if only_with_phone:
+        filtered_df = filtered_df[filtered_df["has_phone"]]
+    if only_group_practices:
+        filtered_df = filtered_df[filtered_df["grp_assgn"] == "Y"]
+    if only_telehealth:
+        filtered_df = filtered_df[filtered_df["Telehlth"].notna() & (filtered_df["Telehlth"].str.strip() != "")]
+
+    # Sort by lead score and organization size
     filtered_df = filtered_df.sort_values(
-        ["lead_score", "doctor_count"], ascending=False
+        ["lead_score", "num_org_mem"], ascending=False
     )
 
     return filtered_df
@@ -229,92 +225,83 @@ def format_address(address):
     """Format address for display"""
     if pd.isna(address) or address == "":
         return "Not available"
-    # Split multiple addresses if pipe separator exists
-    if "|" in address:
-        addresses = address.split("|")
-        return addresses[0].strip()  # Return first address
     return address.strip()
 
 
 def main():
-    st.title("🏥 Healthcare Sales Lead Dashboard")
+    st.title("🏥 Healthcare Sales Lead Dashboard - CMS DAC Data")
     st.markdown(
-        "**Complete Contact Information:** Addresses | Emails | Phone Numbers | Leadership"
+        "**2.8M+ Provider Records** | Phone Numbers | Organization Membership | Specialties"
     )
 
     # Load data
-    with st.spinner("Loading healthcare provider data..."):
+    with st.spinner("Loading CMS DAC healthcare provider data..."):
         df = load_and_process_data()
+
+    if df.empty:
+        st.error("No data loaded. Please check the data file.")
+        return
 
     # Sidebar filters
     with st.sidebar:
         st.header("🎯 Lead Filters")
 
-        # Organization size filter
-        st.subheader("Organization Size")
-        size_categories = df["org_size_category"].unique()
-        # Only set defaults that exist in the data
-        default_sizes = [
-            size
-            for size in [
-                "Enterprise (50+ doctors)",
-                "Large (20-49 doctors)",
-                "Medium (10-19 doctors)",
-            ]
-            if size in size_categories
-        ]
-        selected_sizes = st.multiselect(
-            "Select organization sizes:",
-            sorted(size_categories),
-            default=(
-                default_sizes
-                if default_sizes
-                else (
-                    sorted(size_categories)[:3]
-                    if len(size_categories) >= 3
-                    else sorted(size_categories)
-                )
-            ),
-        )
+        # Member count range filter
+        st.subheader("Organization Member Count")
+        max_member_count = int(df["num_org_mem"].max())
+        col_min, col_max = st.columns(2)
+        with col_min:
+            min_members = st.number_input(
+                "Min members:", min_value=0, max_value=max_member_count, value=2, step=1
+            )
+        with col_max:
+            max_members = st.number_input(
+                "Max members:",
+                min_value=0,
+                max_value=max_member_count,
+                value=50,
+                step=10,
+            )
 
         # State filter
         st.subheader("Geographic Filter")
-        states = df["state_clean"].unique()
-        states = [s for s in states if s != "Unknown"]
-        selected_states = st.multiselect("Select states:", sorted(states), default=[])
+        states = sorted([s for s in df["state_clean"].unique() if s != "Unknown"])
+        selected_states = st.multiselect("Select states:", states, default=[])
+
+        # Specialty filter
+        st.subheader("Specialty Filter")
+        specialties = df["pri_spec"].value_counts().head(30).index.tolist()
+        selected_specialties = st.multiselect(
+            "Select specialties (top 30):",
+            specialties,
+            default=[]
+        )
 
         # Contact filters
         st.subheader("Contact Requirements")
-        only_leadership = st.checkbox("Only show leadership contacts", value=True)
         only_with_phone = st.checkbox("Must have phone number", value=True)
-        only_with_email = st.checkbox("Must have email address", value=False)
+        only_group_practices = st.checkbox("Group practices only", value=False)
+        only_telehealth = st.checkbox("Offers telehealth", value=False)
 
-        # Doctor count range filter
-        st.subheader("Doctor Count Range")
-        max_doctor_count = int(df["doctor_count"].max())
-        col_min, col_max = st.columns(2)
-        with col_min:
-            min_doctors = st.number_input(
-                "Min doctors:",
-                min_value=0,
-                max_value=max_doctor_count,
-                value=5,
-                step=1
-            )
-        with col_max:
-            max_doctors = st.number_input(
-                "Max doctors:",
-                min_value=0,
-                max_value=max_doctor_count,
-                value=max_doctor_count,
-                step=1
-            )
+        # Results per page
+        st.subheader("Display Options")
+        items_per_page = st.selectbox(
+            "Results per page:",
+            options=[25, 50, 100, 200],
+            index=1  # Default to 50
+        )
 
         # Apply filters using cached function
         filtered_df = filter_dataframe(
-            df, tuple(selected_sizes) if selected_sizes else None,
+            df,
+            None,  # No size categories
             tuple(selected_states) if selected_states else None,
-            only_leadership, only_with_phone, only_with_email, min_doctors, max_doctors
+            tuple(selected_specialties) if selected_specialties else None,
+            only_with_phone,
+            min_members,
+            max_members,
+            only_group_practices,
+            only_telehealth,
         )
 
     # Key metrics
@@ -322,29 +309,24 @@ def main():
 
     with col1:
         st.metric(
-            "Total Leads",
+            "Total Records",
             f"{len(filtered_df):,}",
             delta=f"{len(filtered_df[filtered_df['lead_score'] >= 8]):,} high-value",
         )
 
     with col2:
-        avg_doctors = filtered_df["doctor_count"].mean()
+        avg_members = filtered_df["num_org_mem"].mean()
         st.metric(
-            "Avg. Doctors",
-            f"{avg_doctors:.1f}",
-            delta=f"Total: {filtered_df['doctor_count'].sum():,}",
+            "Avg. Members",
+            f"{avg_members:.1f}",
+            delta=f"Total: {filtered_df['num_org_mem'].sum():,}",
         )
 
     with col3:
-        leadership_count = filtered_df["is_leadership"].sum()
+        unique_facilities = filtered_df["Facility Name"].nunique()
         st.metric(
-            "Leadership",
-            f"{leadership_count:,}",
-            delta=(
-                f"{(leadership_count/len(filtered_df)*100):.0f}%"
-                if len(filtered_df) > 0
-                else "0%"
-            ),
+            "Unique Facilities",
+            f"{unique_facilities:,}",
         )
 
     with col4:
@@ -360,85 +342,88 @@ def main():
         )
 
     with col5:
-        email_count = filtered_df["has_email"].sum()
+        group_practices = len(filtered_df[filtered_df["grp_assgn"] == "Y"])
         st.metric(
-            "With Email",
-            f"{email_count:,}",
+            "Group Practices",
+            f"{group_practices:,}",
             delta=(
-                f"{(email_count/len(filtered_df)*100):.0f}%"
+                f"{(group_practices/len(filtered_df)*100):.0f}%"
                 if len(filtered_df) > 0
                 else "0%"
             ),
         )
 
     with col6:
-        enterprise_count = len(filtered_df[filtered_df["doctor_count"] >= 50])
-        st.metric("Enterprise", f"{enterprise_count:,}", delta="50+ doctors")
+        health_systems = len(filtered_df[filtered_df["num_org_mem"] >= 1000])
+        st.metric("Health Systems", f"{health_systems:,}", delta="1000+ members")
 
     # Main content tabs
     tab1, tab2, tab3, tab4, tab5 = st.tabs(
         [
-            "🎯 High-Value Targets",
-            "📊 Organization Analysis",
+            "🎯 Top Organizations",
+            "👥 Provider Details",
+            "📊 Analytics",
             "🗺️ Territory Overview",
-            "📋 Full Lead List",
             "📞 Contact Export",
         ]
     )
 
     with tab1:
-        st.header("High-Value Sales Targets")
+        st.header("Top Healthcare Organizations by Size")
         st.markdown(
-            "Organizations with complete contact information and highest sales potential"
+            "Organizations ranked by member count with complete contact information"
         )
 
-        # Group by organization and get aggregated info
+        # Group by facility and organization
         org_groups = (
-            filtered_df.groupby("agreed_upon_name")
+            filtered_df.groupby(["Facility Name", "org_pac_id"])
             .agg(
                 {
-                    "lead_score": "first",
-                    "doctor_count": "first",
+                    "lead_score": "max",
+                    "num_org_mem": "first",
                     "org_size_category": "first",
-                    "has_email": "max",
                     "has_phone": "max",
                     "state_clean": "first",
                     "city_clean": "first",
                     "phone_clean": "first",
-                    "email": "first",
-                    "contact_full_name": "first",
-                    "Authorized Official Title or Position": "first",
-                    "practice_address": "first",
-                    "mailing_address": "first",
                     "full_address": "first",
-                    "affiliation_address": "first",
-                    "Classification_1": "first",
-                    "Is Sole Proprietor": "first",
-                    "NPI": "first",
+                    "pri_spec": lambda x: x.mode()[0] if not x.mode().empty else "Unknown",
+                    "NPI": "count",  # Count of providers
+                    "grp_assgn": "first",
+                    "Telehlth": "first",
                 }
             )
             .reset_index()
-            .sort_values(["lead_score", "doctor_count"], ascending=False)
+            .sort_values(["num_org_mem", "lead_score"], ascending=False)
         )
 
+        org_groups.rename(columns={"NPI": "provider_count"}, inplace=True)
+
         # Add pagination
-        items_per_page = 50
         total_orgs = len(org_groups)
 
         if total_orgs > items_per_page:
-            page = st.number_input(
-                f"Page (1 to {(total_orgs // items_per_page) + 1})",
-                min_value=1,
-                max_value=(total_orgs // items_per_page) + 1,
-                value=1,
-                step=1
-            )
-            start_idx = (page - 1) * items_per_page
-            end_idx = min(start_idx + items_per_page, total_orgs)
+            total_pages = (total_orgs // items_per_page) + (1 if total_orgs % items_per_page > 0 else 0)
+
+            col_page, col_info = st.columns([1, 2])
+            with col_page:
+                page = st.number_input(
+                    f"Page:",
+                    min_value=1,
+                    max_value=total_pages,
+                    value=1,
+                    step=1,
+                    key="org_page"
+                )
+            with col_info:
+                start_idx = (page - 1) * items_per_page
+                end_idx = min(start_idx + items_per_page, total_orgs)
+                st.info(f"Showing {start_idx+1}-{end_idx} of {total_orgs:,} organizations (Page {page}/{total_pages})")
+
             org_groups_page = org_groups.iloc[start_idx:end_idx]
-            st.info(f"Showing {start_idx+1} to {end_idx} of {total_orgs} organizations")
         else:
             org_groups_page = org_groups
+            st.info(f"Showing all {total_orgs:,} organizations")
 
         # Create two columns for lead cards
         col1, col2 = st.columns(2)
@@ -448,278 +433,257 @@ def main():
                 score_color = (
                     "🟢"
                     if lead["lead_score"] >= 10
-                    else "🟡" if lead["lead_score"] >= 7 else "🔵"
+                    else "🟡" if lead["lead_score"] >= 6 else "🔵"
                 )
-                email_icon = "📧" if lead["has_email"] else ""
-                phone_icon = "📱" if lead["has_phone"] else ""
+                phone_icon = "📱" if lead["has_phone"] else "❌"
+                group_icon = "👥" if lead["grp_assgn"] == "Y" else ""
+                telehealth_icon = "💻" if pd.notna(lead["Telehlth"]) and lead["Telehlth"] != "" else ""
 
                 with st.expander(
-                    f"{score_color} **{lead['agreed_upon_name'][:50]}** (Score: {lead['lead_score']}/13 | {lead['doctor_count']} doctors) {email_icon}{phone_icon}"
+                    f"{score_color} **{lead['Facility Name'][:50]}** ({lead['num_org_mem']} members | {lead['provider_count']} providers) {phone_icon}{group_icon}{telehealth_icon}",
+                    expanded=False,
                 ):
                     # Organization info
                     st.markdown("### 🏥 Organization Details")
                     col_a, col_b = st.columns(2)
                     with col_a:
-                        st.write(f"**Doctor Count:** {lead['doctor_count']} physicians")
+                        st.write(f"**Organization Members:** {lead['num_org_mem']}")
+                        st.write(f"**Providers in Dataset:** {lead['provider_count']}")
                         st.write(f"**Category:** {lead['org_size_category']}")
-                        st.write(f"**Specialization:** {lead['Classification_1']}")
+                        st.write(f"**Primary Specialty:** {lead['pri_spec']}")
                     with col_b:
                         st.write(
                             f"**Location:** {lead['city_clean']}, {lead['state_clean']}"
                         )
+                        st.write(f"**Org PAC ID:** {lead['org_pac_id']}")
                         st.write(
-                            f"**Sole Proprietor:** {'Yes' if lead['Is Sole Proprietor'] == 'Y' else 'No'}"
+                            f"**Group Practice:** {'Yes' if lead['grp_assgn'] == 'Y' else 'No'}"
                         )
-                        st.write(f"**NPI:** {lead['NPI']}")
+                        st.write(f"**Lead Score:** {lead['lead_score']}/14")
 
                     # Contact info
-                    st.markdown("### 👤 Decision Maker Contact")
-                    if lead["contact_full_name"]:
-                        col_c, col_d = st.columns(2)
-                        with col_c:
-                            st.write(f"**Name:** {lead['contact_full_name']}")
-                            st.write(
-                                f"**Title:** {lead['Authorized Official Title or Position']}"
-                            )
-                        with col_d:
-                            if lead["has_phone"]:
-                                st.write(
-                                    f"**📞 Phone:** {format_phone(lead['phone_clean'])}"
-                                )
-                            else:
-                                st.write("**📞 Phone:** Not available")
+                    st.markdown("### 📞 Contact Information")
+                    if lead["has_phone"]:
+                        st.write(f"**Phone:** {format_phone(lead['phone_clean'])}")
+                    else:
+                        st.write("**Phone:** Not available")
 
-                            if lead["has_email"]:
-                                st.write(f"**📧 Email:** {lead['email']}")
-                            else:
-                                st.write("**📧 Email:** Not available")
+                    st.write("**Email:** 🤖 Use Email Discovery Agent (see below)")
 
                     # Address information
-                    st.markdown("### 📍 Address Information")
+                    st.markdown("### 📍 Address")
+                    st.write(format_address(lead["full_address"]))
 
-                    # Practice address
-                    if pd.notna(lead["practice_address"]) and lead["practice_address"]:
-                        st.write("**Practice Location:**")
-                        st.write(f"  {format_address(lead['practice_address'])}")
+                    # Telehealth info
+                    if pd.notna(lead["Telehlth"]) and lead["Telehlth"] != "":
+                        st.markdown("### 💻 Telehealth")
+                        st.write(f"{lead['Telehlth']}")
 
-                    # Mailing address
-                    if pd.notna(lead["mailing_address"]) and lead["mailing_address"]:
-                        st.write("**Mailing Address:**")
-                        st.write(f"  {format_address(lead['mailing_address'])}")
+                    # Show providers at this organization
+                    org_providers = filtered_df[
+                        (filtered_df["Facility Name"] == lead["Facility Name"])
+                        & (filtered_df["org_pac_id"] == lead["org_pac_id"])
+                    ].head(20)  # Limit to first 20 for performance
 
-                    # Full address group if different
-                    if pd.notna(lead["full_address"]) and lead["full_address"]:
-                        if "|" in lead["full_address"]:
-                            st.write("**All Locations:**")
-                            for addr in lead["full_address"].split("|"):
-                                st.write(f"  • {addr.strip()}")
+                    if len(org_providers) > 0:
+                        st.markdown("### 👨‍⚕️ Sample Providers")
+                        for _, provider in org_providers.iterrows():
+                            provider_info = f"• **{provider['provider_full_name']}**"
+                            if provider["Cred"]:
+                                provider_info += f", {provider['Cred']}"
+                            provider_info += f" - {provider['pri_spec']}"
+                            if provider["sec_spec_all"]:
+                                provider_info += f" (Also: {provider['sec_spec_all'][:50]})"
+                            st.write(provider_info)
 
-                    # Show all members/providers in this organization
-                    org_members = filtered_df[
-                        filtered_df["agreed_upon_name"] == lead["agreed_upon_name"]
-                    ]
-                    if len(org_members) > 0:
-                        st.markdown("### 👥 Organization Members")
-
-                        # Show individual providers
-                        providers = org_members[org_members["is_individual_provider"]][
-                            "provider_full_name"
-                        ].unique()
-                        providers = [
-                            p for p in providers if p
-                        ]  # Filter out empty names
-
-                        if providers:
-                            st.write(f"**Providers ({len(providers)}):**")
-                            # Show first 10 providers for performance
-                            for provider_name in providers[:10]:
-                                # Get the row for this provider
-                                provider_rows = org_members[
-                                    org_members["provider_full_name"] == provider_name
-                                ]
-                                if not provider_rows.empty:
-                                    provider_row = provider_rows.iloc[0]
-                                    phone = provider_row.get("phone_clean", "")
-                                    email = provider_row.get("email", "")
-
-                                    provider_info = f"  • {provider_name}"
-                                    if phone and phone != "nan" and len(str(phone)) > 5:
-                                        provider_info += (
-                                            f" | 📞 {format_phone(str(phone))}"
-                                        )
-                                    if email and email != "":
-                                        provider_info += f" | 📧 {email}"
-
-                                    st.write(provider_info)
-                                else:
-                                    st.write(f"  • {provider_name}")
-                            if len(providers) > 10:
-                                st.write(
-                                    f"  _...and {len(providers) - 10} more providers_"
-                                )
-
-                        # Show other decision makers/contacts
-                        other_contacts = org_members[
-                            ~org_members["contact_full_name"].isin(
-                                ["", lead["contact_full_name"]]
-                            )
-                        ]["contact_full_name"].unique()
-                        other_contacts = [
-                            c for c in other_contacts if c
-                        ]  # Filter out empty names
-
-                        if other_contacts:
-                            st.write(f"**Other Contacts ({len(other_contacts)}):**")
-                            for contact in other_contacts[:5]:
-                                contact_row = org_members[
-                                    org_members["contact_full_name"] == contact
-                                ].iloc[0]
-                                title = contact_row.get(
-                                    "Authorized Official Title or Position", ""
-                                )
-                                phone = contact_row.get("phone_clean", "")
-                                email = contact_row.get("email", "")
-
-                                contact_info = f"  • {contact}"
-                                if title and title != "nan":
-                                    contact_info += f" - {title}"
-                                if phone and phone != "nan" and len(str(phone)) > 5:
-                                    contact_info += f" | 📞 {format_phone(str(phone))}"
-                                if email and email != "":
-                                    contact_info += f" | 📧 {email}"
-
-                                st.write(contact_info)
-                            if len(other_contacts) > 5:
-                                st.write(
-                                    f"  _...and {len(other_contacts) - 5} more contacts_"
-                                )
+                        if lead["provider_count"] > 20:
+                            st.write(f"_...and {lead['provider_count'] - 20} more providers_")
 
     with tab2:
-        st.header("Organization Size Analysis")
+        st.header("Individual Provider Details")
+        st.markdown("Search and explore individual healthcare providers")
+
+        # Search functionality
+        search_term = st.text_input(
+            "🔍 Search by provider name, facility, specialty, or city:"
+        )
+
+        search_df = filtered_df.copy()
+        if search_term:
+            mask = (
+                search_df["provider_full_name"].str.contains(search_term, case=False, na=False)
+                | search_df["Facility Name"].str.contains(search_term, case=False, na=False)
+                | search_df["pri_spec"].str.contains(search_term, case=False, na=False)
+                | search_df["city_clean"].str.contains(search_term, case=False, na=False)
+            )
+            search_df = search_df[mask]
+
+        # Display provider table
+        display_cols = [
+            "provider_full_name",
+            "Cred",
+            "pri_spec",
+            "Facility Name",
+            "num_org_mem",
+            "city_clean",
+            "state_clean",
+            "phone_clean",
+            "Med_sch",
+            "Grd_yr",
+        ]
+
+        display_df = search_df[display_cols].copy()
+        display_df.columns = [
+            "Provider Name",
+            "Credentials",
+            "Specialty",
+            "Facility",
+            "Org Members",
+            "City",
+            "State",
+            "Phone",
+            "Medical School",
+            "Graduation Year",
+        ]
+
+        # Add pagination
+        providers_per_page = 100
+        total_items = len(display_df)
+
+        if total_items > providers_per_page:
+            total_pages = (total_items // providers_per_page) + (1 if total_items % providers_per_page > 0 else 0)
+
+            col_page, col_info = st.columns([1, 2])
+            with col_page:
+                page_num = st.number_input(
+                    f"Page:",
+                    min_value=1,
+                    max_value=total_pages,
+                    value=1,
+                    step=1,
+                    key="provider_list_page",
+                )
+            with col_info:
+                start_idx = (page_num - 1) * providers_per_page
+                end_idx = min(start_idx + providers_per_page, total_items)
+                st.info(f"Showing {start_idx+1}-{end_idx} of {total_items:,} providers (Page {page_num}/{total_pages})")
+
+            display_page = display_df.iloc[start_idx:end_idx]
+        else:
+            display_page = display_df
+            st.info(f"Showing all {len(display_df):,} providers")
+
+        st.dataframe(
+            display_page,
+            use_container_width=True,
+            height=600,
+            column_config={
+                "Org Members": st.column_config.NumberColumn("Org Members", format="%d"),
+                "Graduation Year": st.column_config.NumberColumn("Grad Year", format="%d"),
+            },
+        )
+
+    with tab3:
+        st.header("Organization & Provider Analytics")
 
         col1, col2 = st.columns(2)
 
         with col1:
             # Organization size distribution
             size_dist = (
-                filtered_df.groupby("org_size_category")["doctor_count"]
-                .agg(["count", "sum"])
+                filtered_df.groupby("org_size_category")
+                .agg({"num_org_mem": ["count", "sum"]})
                 .reset_index()
             )
-            size_dist.columns = ["Category", "Number of Organizations", "Total Doctors"]
+            size_dist.columns = ["Category", "Provider Count", "Total Members"]
 
             fig = px.bar(
                 size_dist,
                 x="Category",
-                y="Number of Organizations",
-                title="Organizations by Size Category",
-                text="Number of Organizations",
-                color="Total Doctors",
+                y="Provider Count",
+                title="Providers by Organization Size Category",
+                text="Provider Count",
+                color="Total Members",
                 color_continuous_scale="Blues",
             )
             fig.update_traces(texttemplate="%{text}", textposition="outside")
+            fig.update_xaxes(tickangle=45)
             st.plotly_chart(fig, use_container_width=True)
 
         with col2:
-            # Top organizations by doctor count
-            st.subheader("Largest Healthcare Organizations")
-            top_orgs = filtered_df.nlargest(10, "doctor_count")[
-                [
-                    "agreed_upon_name",
-                    "doctor_count",
-                    "state_clean",
-                    "has_email",
-                    "has_phone",
-                ]
-            ]
-            top_orgs["Contact Status"] = top_orgs.apply(
-                lambda x: (
-                    "📧📱"
-                    if x["has_email"] and x["has_phone"]
-                    else "📧" if x["has_email"] else "📱" if x["has_phone"] else "❌"
-                ),
-                axis=1,
+            # Top specialties
+            specialty_counts = filtered_df["pri_spec"].value_counts().head(15)
+            specialty_df = pd.DataFrame({
+                'Specialty': specialty_counts.index,
+                'Count': specialty_counts.values
+            })
+            fig = px.bar(
+                specialty_df,
+                x="Count",
+                y="Specialty",
+                orientation="h",
+                title="Top 15 Specialties",
             )
-            display_orgs = top_orgs[
-                ["agreed_upon_name", "doctor_count", "state_clean", "Contact Status"]
-            ].copy()
-            display_orgs.columns = ["Organization", "Doctors", "State", "Contact"]
-            st.dataframe(display_orgs, hide_index=True, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True)
 
-        # Contact availability analysis
-        st.subheader("Contact Information Availability")
-        col3, col4, col5 = st.columns(3)
-
-        with col3:
-            contact_stats = pd.DataFrame(
+        # Top facilities by member count
+        st.subheader("Largest Healthcare Organizations")
+        top_facilities = (
+            filtered_df.groupby("Facility Name")
+            .agg(
                 {
-                    "Type": ["Phone Only", "Email Only", "Both", "Neither"],
-                    "Count": [
-                        len(
-                            filtered_df[
-                                filtered_df["has_phone"] & ~filtered_df["has_email"]
-                            ]
-                        ),
-                        len(
-                            filtered_df[
-                                ~filtered_df["has_phone"] & filtered_df["has_email"]
-                            ]
-                        ),
-                        len(
-                            filtered_df[
-                                filtered_df["has_phone"] & filtered_df["has_email"]
-                            ]
-                        ),
-                        len(
-                            filtered_df[
-                                ~filtered_df["has_phone"] & ~filtered_df["has_email"]
-                            ]
-                        ),
-                    ],
+                    "num_org_mem": "first",
+                    "NPI": "count",
+                    "state_clean": "first",
+                    "city_clean": "first",
+                    "has_phone": "max",
                 }
             )
+            .reset_index()
+            .sort_values("num_org_mem", ascending=False)
+            .head(20)
+        )
+        top_facilities.columns = [
+            "Facility",
+            "Members",
+            "Providers",
+            "State",
+            "City",
+            "Has Phone",
+        ]
+        top_facilities["Contact"] = top_facilities["Has Phone"].apply(
+            lambda x: "📱" if x else "❌"
+        )
+        display_facilities = top_facilities[["Facility", "Members", "Providers", "City", "State", "Contact"]]
+        st.dataframe(display_facilities, hide_index=True, use_container_width=True, height=400)
+
+        # Gender distribution
+        col3, col4 = st.columns(2)
+        with col3:
+            gender_dist = filtered_df["gndr"].value_counts()
             fig = px.pie(
-                contact_stats,
-                values="Count",
-                names="Type",
-                title="Contact Information Coverage",
+                values=gender_dist.values,
+                names=gender_dist.index,
+                title="Provider Gender Distribution",
             )
             st.plotly_chart(fig, use_container_width=True)
 
         with col4:
-            # Leadership distribution
-            leadership_df = filtered_df[filtered_df["is_leadership"]]
-            title_counts = (
-                leadership_df["Authorized Official Title or Position"]
-                .value_counts()
-                .head(10)
-            )
-
-            title_df = pd.DataFrame(
-                {"Title": title_counts.index, "Count": title_counts.values}
-            )
-
-            fig = px.bar(
-                title_df,
-                x="Count",
-                y="Title",
-                orientation="h",
-                title="Top 10 Leadership Titles",
+            # Graduation year distribution (for recent grads)
+            grad_years = filtered_df[filtered_df["Grd_yr"] >= 2000]["Grd_yr"].value_counts().sort_index()
+            grad_years_df = pd.DataFrame({
+                'Year': grad_years.index,
+                'Count': grad_years.values
+            })
+            fig = px.line(
+                grad_years_df,
+                x="Year",
+                y="Count",
+                title="Provider Graduation Years (2000+)",
             )
             st.plotly_chart(fig, use_container_width=True)
 
-        with col5:
-            # Email domains analysis for those with emails
-            email_df = filtered_df[filtered_df["has_email"]].copy()
-            if len(email_df) > 0:
-                email_df["domain"] = email_df["email"].str.split("@").str[1]
-                domain_counts = email_df["domain"].value_counts().head(10)
-
-                st.subheader("Top Email Domains")
-                for domain, count in domain_counts.items():
-                    st.write(f"**{domain}:** {count}")
-
-    with tab3:
+    with tab4:
         st.header("Territory Analysis")
 
         # State-level metrics
@@ -727,27 +691,25 @@ def main():
             filtered_df.groupby("state_clean")
             .agg(
                 {
-                    "doctor_count": ["sum", "mean"],
-                    "agreed_upon_name": "count",
-                    "is_leadership": "sum",
+                    "num_org_mem": ["sum", "mean"],
+                    "NPI": "count",
+                    "Facility Name": "nunique",
                     "has_phone": "sum",
-                    "has_email": "sum",
                 }
             )
             .round(1)
         )
 
         state_metrics.columns = [
-            "Total Doctors",
-            "Avg Doctors/Org",
-            "Organizations",
-            "Leadership Contacts",
+            "Total Members",
+            "Avg Members/Provider",
+            "Providers",
+            "Unique Facilities",
             "With Phone",
-            "With Email",
         ]
         state_metrics = state_metrics.sort_values(
-            "Total Doctors", ascending=False
-        ).head(20)
+            "Total Members", ascending=False
+        ).head(25)
 
         col1, col2 = st.columns([2, 1])
 
@@ -755,222 +717,121 @@ def main():
             fig = px.bar(
                 state_metrics.reset_index(),
                 x="state_clean",
-                y="Total Doctors",
-                title="Total Doctors by State (Top 20)",
-                text="Total Doctors",
-                color="Organizations",
+                y="Total Members",
+                title="Total Organization Members by State (Top 25)",
+                text="Total Members",
+                color="Providers",
                 color_continuous_scale="Viridis",
             )
             fig.update_traces(texttemplate="%{text}", textposition="outside")
             st.plotly_chart(fig, use_container_width=True)
 
         with col2:
-            st.subheader("Top 10 States Summary")
+            st.subheader("Top 10 States")
             st.dataframe(state_metrics.head(10), use_container_width=True)
 
         # City analysis
-        st.subheader("Top Cities by Total Doctors")
+        st.subheader("Top Cities by Provider Count")
         city_metrics = (
-            filtered_df.groupby("city_clean")
+            filtered_df.groupby(["city_clean", "state_clean"])
             .agg(
                 {
-                    "doctor_count": "sum",
-                    "agreed_upon_name": "count",
+                    "NPI": "count",
+                    "Facility Name": "nunique",
+                    "num_org_mem": "sum",
                     "has_phone": "sum",
-                    "has_email": "sum",
                 }
             )
-            .sort_values("doctor_count", ascending=False)
-            .head(15)
+            .sort_values("NPI", ascending=False)
+            .head(20)
         )
         city_metrics.columns = [
-            "Total Doctors",
-            "Organizations",
+            "Providers",
+            "Facilities",
+            "Total Members",
             "With Phone",
-            "With Email",
         ]
+        city_metrics = city_metrics.reset_index()
+        city_metrics["Location"] = city_metrics["city_clean"] + ", " + city_metrics["state_clean"]
 
         fig = px.bar(
-            city_metrics.reset_index(),
-            x="city_clean",
-            y="Total Doctors",
-            title="Top 15 Cities by Healthcare Presence",
-            text="Total Doctors",
-            hover_data=["Organizations", "With Phone", "With Email"],
+            city_metrics,
+            x="Location",
+            y="Providers",
+            title="Top 20 Cities by Provider Count",
+            text="Providers",
+            hover_data=["Facilities", "Total Members", "With Phone"],
         )
         fig.update_traces(texttemplate="%{text}", textposition="outside")
         fig.update_xaxes(tickangle=45)
         st.plotly_chart(fig, use_container_width=True)
 
-    with tab4:
-        st.header("Complete Lead List")
-        st.markdown(
-            "Search and browse all filtered leads with complete contact information"
-        )
-
-        # Prepare display dataframe
-        display_cols = [
-            "lead_score",
-            "agreed_upon_name",
-            "doctor_count",
-            "org_size_category",
-            "contact_full_name",
-            "Authorized Official Title or Position",
-            "phone_clean",
-            "email",
-            "city_clean",
-            "state_clean",
-            "mailing_address",
-            "Classification_1",
-        ]
-
-        display_df = filtered_df[display_cols].copy()
-        display_df.columns = [
-            "Score",
-            "Organization",
-            "Doctors",
-            "Size Category",
-            "Contact Name",
-            "Title",
-            "Phone",
-            "Email",
-            "City",
-            "State",
-            "Address",
-            "Specialization",
-        ]
-
-        # Add search
-        search_term = st.text_input(
-            "🔍 Search organizations, contacts, cities, or emails:"
-        )
-        if search_term:
-            mask = display_df.apply(
-                lambda x: x.astype(str).str.contains(search_term, case=False).any(),
-                axis=1,
-            )
-            display_df = display_df[mask]
-
-        # Contact status filter
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            show_with_email = st.checkbox("Show only with email", value=False)
-        with col2:
-            show_with_phone = st.checkbox("Show only with phone", value=False)
-        with col3:
-            show_with_both = st.checkbox(
-                "Show only with both email & phone", value=False
-            )
-
-        if show_with_both:
-            display_df = display_df[
-                (display_df["Email"] != "") & (display_df["Phone"] != "nan")
-            ]
-        elif show_with_email:
-            display_df = display_df[display_df["Email"] != ""]
-        elif show_with_phone:
-            display_df = display_df[display_df["Phone"] != "nan"]
-
-        # Add pagination for better performance
-        items_per_page = 100
-        total_items = len(display_df)
-
-        if total_items > items_per_page:
-            _, col_p2, _ = st.columns([1, 2, 1])
-            with col_p2:
-                page_num = st.number_input(
-                    f"Page (1 to {(total_items // items_per_page) + 1})",
-                    min_value=1,
-                    max_value=(total_items // items_per_page) + 1,
-                    value=1,
-                    step=1,
-                    key="lead_list_page"
-                )
-            start_idx = (page_num - 1) * items_per_page
-            end_idx = min(start_idx + items_per_page, total_items)
-            display_page = display_df.iloc[start_idx:end_idx]
-            st.info(f"Showing {start_idx+1} to {end_idx} of {total_items} filtered leads")
-        else:
-            display_page = display_df
-            st.info(f"Showing all {len(display_df):,} filtered leads")
-
-        st.dataframe(
-            display_page,
-            use_container_width=True,
-            height=600,
-            column_config={
-                "Score": st.column_config.NumberColumn("Score", format="%d ⭐"),
-                "Doctors": st.column_config.NumberColumn("Doctors", format="%d"),
-                "Phone": st.column_config.TextColumn("Phone", width="medium"),
-                "Email": st.column_config.TextColumn("Email", width="large"),
-                "Address": st.column_config.TextColumn("Address", width="large"),
-            },
-        )
-
     with tab5:
         st.header("Export Contact List")
         st.markdown(
-            "Download filtered leads with complete contact information for CRM import"
+            "Download filtered data for outreach. **Note:** Emails not included in CMS data - use Email Discovery Agent below."
         )
 
-        # Prepare export data with all contact fields
+        # Prepare export data
         export_df = filtered_df[
             [
-                "agreed_upon_name",
-                "doctor_count",
+                "Facility Name",
+                "org_pac_id",
+                "num_org_mem",
                 "org_size_category",
-                "contact_full_name",
-                "Authorized Official Title or Position",
+                "provider_full_name",
+                "Cred",
+                "pri_spec",
+                "sec_spec_all",
                 "phone_clean",
-                "email",
-                "mailing_address",
-                "practice_address",
                 "full_address",
                 "city_clean",
                 "state_clean",
-                "mailing_city",
-                "mailing_state",
-                "Classification_1",
+                "ZIP Code",
+                "grp_assgn",
+                "ind_assgn",
                 "lead_score",
                 "NPI",
-                "Is Sole Proprietor",
-                "is_leadership",
-                "has_phone",
-                "has_email",
+                "Ind_PAC_ID",
+                "gndr",
+                "Med_sch",
+                "Grd_yr",
+                "Telehlth",
             ]
         ].copy()
 
         export_df.columns = [
-            "Organization_Name",
-            "Doctor_Count",
+            "Facility_Name",
+            "Organization_PAC_ID",
+            "Organization_Members",
             "Size_Category",
-            "Contact_Name",
-            "Contact_Title",
+            "Provider_Name",
+            "Credentials",
+            "Primary_Specialty",
+            "Secondary_Specialties",
             "Phone",
-            "Email",
-            "Mailing_Address",
-            "Practice_Address",
-            "All_Addresses",
+            "Address",
             "City",
             "State",
-            "Mailing_City",
-            "Mailing_State",
-            "Specialization",
+            "ZIP",
+            "Group_Assignment",
+            "Individual_Assignment",
             "Lead_Score",
             "NPI",
-            "Is_Sole_Proprietor",
-            "Is_Leadership",
-            "Has_Phone",
-            "Has_Email",
+            "Individual_PAC_ID",
+            "Gender",
+            "Medical_School",
+            "Graduation_Year",
+            "Telehealth",
         ]
 
         # Show preview
         st.subheader("Export Preview")
         preview_cols = [
-            "Organization_Name",
-            "Contact_Name",
+            "Facility_Name",
+            "Organization_Members",
+            "Provider_Name",
             "Phone",
-            "Email",
             "City",
             "State",
             "Lead_Score",
@@ -983,63 +844,69 @@ def main():
         with col1:
             st.metric("Total Records", f"{len(export_df):,}")
         with col2:
-            st.metric("With Email", f"{export_df['Has_Email'].sum():,}")
+            unique_facilities = export_df["Facility_Name"].nunique()
+            st.metric("Unique Facilities", f"{unique_facilities:,}")
         with col3:
-            st.metric("With Phone", f"{export_df['Has_Phone'].sum():,}")
+            with_phone = len(export_df[export_df["Phone"] != ""])
+            st.metric("With Phone", f"{with_phone:,}")
         with col4:
-            st.metric("Leadership", f"{export_df['Is_Leadership'].sum():,}")
+            high_value = len(export_df[export_df["Lead_Score"] >= 8])
+            st.metric("High Value", f"{high_value:,}")
 
         # Export options
         st.subheader("Download Options")
         col1, col2, col3 = st.columns(3)
 
         with col1:
-            # High-value leads with complete contact info
-            complete_contact_df = export_df[
-                (export_df["Has_Email"])
-                & (export_df["Has_Phone"])
-                & (export_df["Lead_Score"] >= 8)
-            ]
-            csv_complete = complete_contact_df.to_csv(index=False).encode("utf-8")
+            # High-value leads
+            high_value_df = export_df[export_df["Lead_Score"] >= 8]
+            csv_high = high_value_df.to_csv(index=False).encode("utf-8")
             st.download_button(
-                label=f"⭐ Premium Leads ({len(complete_contact_df):,})",
-                data=csv_complete,
-                file_name=f'premium_leads_complete_contact_{datetime.now().strftime("%Y%m%d")}.csv',
+                label=f"⭐ High-Value Leads ({len(high_value_df):,})",
+                data=csv_high,
+                file_name=f'high_value_leads_{datetime.now().strftime("%Y%m%d")}.csv',
                 mime="text/csv",
-                help="High-score leads with both email and phone",
+                help="Organizations with lead score >= 8",
             )
 
         with col2:
-            # All filtered leads
+            # All filtered data
             csv_all = export_df.to_csv(index=False).encode("utf-8")
             st.download_button(
-                label=f"📥 All Filtered Leads ({len(export_df):,})",
+                label=f"📥 All Filtered Data ({len(export_df):,})",
                 data=csv_all,
-                file_name=f'all_filtered_leads_{datetime.now().strftime("%Y%m%d")}.csv',
+                file_name=f'all_filtered_data_{datetime.now().strftime("%Y%m%d")}.csv',
                 mime="text/csv",
             )
 
         with col3:
-            # Email campaign list
-            email_list_df = export_df[export_df["Has_Email"]][
-                [
-                    "Organization_Name",
-                    "Contact_Name",
-                    "Contact_Title",
-                    "Email",
-                    "Doctor_Count",
-                    "City",
-                    "State",
-                ]
-            ]
-            csv_email = email_list_df.to_csv(index=False).encode("utf-8")
+            # Large organizations only
+            large_orgs_df = export_df[export_df["Organization_Members"] >= 100]
+            csv_large = large_orgs_df.to_csv(index=False).encode("utf-8")
             st.download_button(
-                label=f"📧 Email Campaign List ({len(email_list_df):,})",
-                data=csv_email,
-                file_name=f'email_campaign_list_{datetime.now().strftime("%Y%m%d")}.csv',
+                label=f"🏢 Large Organizations ({len(large_orgs_df):,})",
+                data=csv_large,
+                file_name=f'large_organizations_{datetime.now().strftime("%Y%m%d")}.csv',
                 mime="text/csv",
-                help="Contacts with email addresses for email campaigns",
+                help="Organizations with 100+ members",
             )
+
+        # Email Discovery Agent Section
+        st.divider()
+        st.subheader("🤖 Email Discovery Agent")
+        st.markdown("""
+        **Note:** The CMS DAC dataset does not include email addresses. To find emails for your leads,
+        you'll need to use the Email Discovery Agent (see implementation details below).
+
+        The agent will:
+        1. Take facility names and addresses as input
+        2. Search for organization websites
+        3. Find contact pages and staff directories
+        4. Extract email patterns and specific contact emails
+        5. Return results in a structured format
+
+        **See the `email_agent.py` file for the implementation.**
+        """)
 
 
 if __name__ == "__main__":

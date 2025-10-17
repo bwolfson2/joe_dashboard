@@ -1,11 +1,13 @@
 services:
   dashboard:
     build: .
-    container_name: sales-lead-dashboard
+    container_name: healthcare-sales-dashboard
     ports:
       - "8501:8501"
     volumes:
-      - ./contact_info_for_joe.csv:/app/contact_info_for_joe.csv:ro
+      # Mount .env for email agent API keys (optional)
+      - ./.env:/app/.env:ro
+      # Mount cache directory for email agent
       - ./data:/app/data
     environment:
       - STREAMLIT_SERVER_PORT=8501
