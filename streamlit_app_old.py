@@ -1,13 +1,3 @@
-"""
-OPTIMIZED Healthcare Sales Lead Dashboard - Reduced CPU usage by 80%+
-
-Key optimizations:
-1. Uses preprocessed data (no expensive string operations at runtime)
-2. Lazy loading for tabs (only compute when viewed)
-3. Aggressive result limiting to prevent processing millions of rows
-4. Efficient filtering with combined boolean indexing
-5. Cached groupby operations with smaller result sets
-"""
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -22,18 +12,35 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Minimal CSS for better formatting
+# Custom CSS for better formatting
 st.markdown(
     """
 <style>
     .main > div {
-        padding-top: 0.5rem;
+        padding-top: 1rem;
     }
     .stMetric {
         background-color: #f0f2f6;
-        padding: 10px;
-        border-radius: 8px;
+        padding: 15px;
+        border-radius: 10px;
         box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+    .lead-card {
+        background-color: #ffffff;
+        padding: 20px;
+        border-radius: 10px;
+        box-shadow: 0 2px 6px rgba(0,0,0,0.1);
+        margin-bottom: 15px;
+        border-left: 4px solid #1f77b4;
+    }
+    .high-value {
+        border-left: 4px solid #28a745 !important;
+    }
+    .contact-info {
+        background-color: #e8f4f8;
+        padding: 10px;
+        border-radius: 5px;
+        margin: 10px 0;
     }
 </style>
 """,
@@ -41,31 +48,135 @@ st.markdown(
 )
 
 
-@st.cache_data(ttl=3600)
-def load_preprocessed_data():
-    """Load preprocessed data - NO expensive operations here"""
-    try:
-        df = pd.read_parquet("data/preprocessed_dashboard_data.parquet")
-        return df
-    except FileNotFoundError:
-        st.error("❌ Preprocessed data not found!")
-        st.info("Run: `python scripts/01_data_preparation/preprocess_for_dashboard.py`")
+@st.cache_data(ttl=3600)  # Cache for 1 hour
+def load_and_process_data():
+    """Load and process the CMS DAC healthcare provider data from parquet chunks"""
+
+    # Load from 3 parquet files (70% smaller than CSV, faster loading)
+    parquet_files = [f"DAC_parquet_{i}.parquet" for i in range(1, 4)]
+
+    dfs = []
+    missing_files = []
+
+    for parquet_file in parquet_files:
+        try:
+            chunk_df = pd.read_parquet(parquet_file)
+            dfs.append(chunk_df)
+        except FileNotFoundError:
+            missing_files.append(parquet_file)
+
+    if missing_files:
+        st.error(f"Missing parquet files: {', '.join(missing_files)}")
+        st.info("Run the split script to create parquet chunks")
         return pd.DataFrame()
 
+    if not dfs:
+        st.error("No data files found!")
+        return pd.DataFrame()
 
-@st.cache_data
-def get_filter_options(df):
-    """Cache expensive unique value operations"""
-    return {
-        "states": sorted([s for s in df["state_clean"].unique() if s != "Unknown"]),
-        "specialties": df["pri_spec"].value_counts().head(30).index.tolist(),
-        "max_members": int(df["num_org_mem"].max()),
-    }
+    # Combine all chunks
+    df = pd.concat(dfs, ignore_index=True)
+
+    # Clean and process key fields
+    df["num_org_mem"] = (
+        pd.to_numeric(df["num_org_mem"], errors="coerce").fillna(0).astype(int)
+    )
+
+    # Clean phone numbers (they're loaded as floats in scientific notation)
+    def clean_phone(phone):
+        if pd.isna(phone):
+            return ""
+        # Convert float to int to string to avoid scientific notation
+        phone_str = str(int(phone)) if isinstance(phone, float) else str(phone)
+        # Remove any non-digits
+        phone_clean = ''.join(filter(str.isdigit, phone_str))
+        return phone_clean if len(phone_clean) == 10 else ""
+
+    df["phone_clean"] = df["Telephone Number"].apply(clean_phone)
+    df["has_phone"] = df["phone_clean"].str.len() == 10
+
+    # For now, no emails in this dataset - we'll need the agent to find them
+    df["email"] = ""
+    df["has_email"] = False
+
+    # Create provider full name
+    df["provider_full_name"] = (
+        df["Provider First Name"].fillna("")
+        + " "
+        + df["Provider Last Name"].fillna("")
+    ).str.strip()
+
+    # Create full address from components
+    df["full_address"] = (
+        df["adr_ln_1"].astype(str).replace("nan", "")
+        + ", "
+        + df["adr_ln_2"].astype(str).replace("nan", "")
+        + ", "
+        + df["City/Town"].astype(str).replace("nan", "")
+        + ", "
+        + df["State"].astype(str).replace("nan", "")
+        + " "
+        + df["ZIP Code"].astype(str).str.replace(".0", "").replace("nan", "")
+    ).str.replace(", , ", ", ").str.replace(", ,", ",").str.strip(", ")
+
+    # Clean states and cities
+    df["state_clean"] = df["State"].astype(str).replace("nan", "Unknown")
+    df["city_clean"] = df["City/Town"].astype(str).replace("nan", "Unknown")
+
+    # Clean facility names
+    df["Facility Name"] = df["Facility Name"].astype(str).replace("nan", "Unknown Organization")
+
+    # Clean specialties
+    df["pri_spec"] = df["pri_spec"].astype(str).replace("nan", "Unknown")
+    df["sec_spec_all"] = df["sec_spec_all"].astype(str).replace("nan", "")
+
+    # Credentials and education
+    df["Cred"] = df["Cred"].astype(str).str.strip().replace("nan", "")
+    df["Med_sch"] = df["Med_sch"].astype(str).replace("nan", "Unknown")
+    df["Grd_yr"] = pd.to_numeric(df["Grd_yr"], errors="coerce")
+
+    # Calculate organization size category
+    df["org_size_category"] = pd.cut(
+        df["num_org_mem"],
+        bins=[-1, 0, 10, 50, 100, 300, 1000, float("inf")],
+        labels=[
+            "Unknown",
+            "Small Practice (1-10 members)",
+            "Medium (11-50 members)",
+            "Large (51-100 members)",
+            "Very Large (101-300 members)",
+            "Enterprise (301-1000 members)",
+            "Health System (1000+ members)",
+        ],
+    )
+
+    # Lead scoring based on sales criteria
+    df["lead_score"] = 0
+
+    # Score based on organization member count
+    df.loc[df["num_org_mem"] >= 1000, "lead_score"] += 10
+    df.loc[(df["num_org_mem"] >= 300) & (df["num_org_mem"] < 1000), "lead_score"] += 8
+    df.loc[(df["num_org_mem"] >= 100) & (df["num_org_mem"] < 300), "lead_score"] += 6
+    df.loc[(df["num_org_mem"] >= 50) & (df["num_org_mem"] < 100), "lead_score"] += 4
+    df.loc[(df["num_org_mem"] >= 10) & (df["num_org_mem"] < 50), "lead_score"] += 2
+    df.loc[(df["num_org_mem"] > 0) & (df["num_org_mem"] < 10), "lead_score"] += 1
+
+    # Score for having phone number
+    df.loc[df["has_phone"], "lead_score"] += 2
+
+    # Score for group assignment (more valuable for sales)
+    df.loc[df["grp_assgn"] == "Y", "lead_score"] += 1
+
+    # Score for telehealth capability
+    df.loc[df["Telehlth"].notna() & (df["Telehlth"].str.strip() != ""), "lead_score"] += 1
+
+    return df
 
 
 @st.cache_data
 def filter_dataframe(
     df,
+    selected_sizes,  # Kept for backwards compatibility but not used
     selected_states,
     selected_specialties,
     only_with_phone,
@@ -74,63 +185,32 @@ def filter_dataframe(
     only_group_practices,
     only_telehealth,
 ):
-    """Optimized filtering with combined boolean indexing"""
-    # Build combined filter mask (much faster than sequential filtering)
-    mask = (df["num_org_mem"] >= min_members) & (df["num_org_mem"] <= max_members)
+    """Cache filtered results for better performance"""
+    filtered_df = df.copy()
+
+    # Filter by member count first (most selective)
+    filtered_df = filtered_df[
+        (filtered_df["num_org_mem"] >= min_members)
+        & (filtered_df["num_org_mem"] <= max_members)
+    ]
 
     if selected_states:
-        mask &= df["state_clean"].isin(selected_states)
+        filtered_df = filtered_df[filtered_df["state_clean"].isin(selected_states)]
     if selected_specialties:
-        mask &= df["pri_spec"].isin(selected_specialties)
+        filtered_df = filtered_df[filtered_df["pri_spec"].isin(selected_specialties)]
     if only_with_phone:
-        mask &= df["has_phone"]
+        filtered_df = filtered_df[filtered_df["has_phone"]]
     if only_group_practices:
-        mask &= df["grp_assgn"] == "Y"
+        filtered_df = filtered_df[filtered_df["grp_assgn"] == "Y"]
     if only_telehealth:
-        mask &= df["Telehlth"].notna() & (df["Telehlth"].str.strip() != "")
+        filtered_df = filtered_df[filtered_df["Telehlth"].notna() & (filtered_df["Telehlth"].str.strip() != "")]
 
-    # Apply mask once
-    filtered_df = df[mask].copy()
-
-    # Sort only if needed
-    if len(filtered_df) > 0:
-        filtered_df = filtered_df.sort_values(
-            ["lead_score", "num_org_mem"], ascending=False
-        )
-
-    return filtered_df
-
-
-@st.cache_data
-def get_top_organizations(filtered_df, limit=1000):
-    """Get top organizations with limit to prevent processing millions of rows"""
-    # Only process top N rows by lead score
-    top_df = filtered_df.head(limit)
-
-    org_groups = (
-        top_df.groupby(["Facility Name", "org_pac_id"])
-        .agg(
-            {
-                "lead_score": "max",
-                "num_org_mem": "first",
-                "org_size_category": "first",
-                "has_phone": "max",
-                "state_clean": "first",
-                "city_clean": "first",
-                "phone_clean": "first",
-                "full_address": "first",
-                "pri_spec": lambda x: x.mode()[0] if not x.mode().empty else "Unknown",
-                "NPI": "count",
-                "grp_assgn": "first",
-                "Telehlth": "first",
-            }
-        )
-        .reset_index()
-        .sort_values(["num_org_mem", "lead_score"], ascending=False)
+    # Sort by lead score and organization size
+    filtered_df = filtered_df.sort_values(
+        ["lead_score", "num_org_mem"], ascending=False
     )
 
-    org_groups.rename(columns={"NPI": "provider_count"}, inplace=True)
-    return org_groups
+    return filtered_df
 
 
 def format_phone(phone):
@@ -151,19 +231,16 @@ def format_address(address):
 def main():
     st.title("🏥 Healthcare Sales Lead Dashboard - CMS DAC Data")
     st.markdown(
-        "**2.8M+ Provider Records** | Optimized for Performance | Phone Numbers | Organization Membership"
+        "**2.8M+ Provider Records** | Phone Numbers | Organization Membership | Specialties"
     )
 
-    # Load preprocessed data (fast!)
-    with st.spinner("Loading data..."):
-        df = load_preprocessed_data()
+    # Load data
+    with st.spinner("Loading CMS DAC healthcare provider data..."):
+        df = load_and_process_data()
 
     if df.empty:
-        st.error("No data loaded. Run preprocessing script first.")
+        st.error("No data loaded. Please check the data file.")
         return
-
-    # Get filter options (cached)
-    filter_options = get_filter_options(df)
 
     # Sidebar filters
     with st.sidebar:
@@ -171,34 +248,33 @@ def main():
 
         # Member count range filter
         st.subheader("Organization Member Count")
+        max_member_count = int(df["num_org_mem"].max())
         col_min, col_max = st.columns(2)
         with col_min:
             min_members = st.number_input(
-                "Min members:",
-                min_value=0,
-                max_value=filter_options["max_members"],
-                value=2,
-                step=1,
+                "Min members:", min_value=0, max_value=max_member_count, value=2, step=1
             )
         with col_max:
             max_members = st.number_input(
                 "Max members:",
                 min_value=0,
-                max_value=filter_options["max_members"],
+                max_value=max_member_count,
                 value=50,
                 step=10,
             )
 
         # State filter
         st.subheader("Geographic Filter")
-        selected_states = st.multiselect(
-            "Select states:", filter_options["states"], default=[]
-        )
+        states = sorted([s for s in df["state_clean"].unique() if s != "Unknown"])
+        selected_states = st.multiselect("Select states:", states, default=[])
 
         # Specialty filter
         st.subheader("Specialty Filter")
+        specialties = df["pri_spec"].value_counts().head(30).index.tolist()
         selected_specialties = st.multiselect(
-            "Select specialties (top 30):", filter_options["specialties"], default=[]
+            "Select specialties (top 30):",
+            specialties,
+            default=[]
         )
 
         # Contact filters
@@ -210,12 +286,15 @@ def main():
         # Results per page
         st.subheader("Display Options")
         items_per_page = st.selectbox(
-            "Results per page:", options=[25, 50, 100, 200], index=1
+            "Results per page:",
+            options=[25, 50, 100, 200],
+            index=1  # Default to 50
         )
 
-        # Apply filters
+        # Apply filters using cached function
         filtered_df = filter_dataframe(
             df,
+            None,  # No size categories
             tuple(selected_states) if selected_states else None,
             tuple(selected_specialties) if selected_specialties else None,
             only_with_phone,
@@ -225,19 +304,18 @@ def main():
             only_telehealth,
         )
 
-    # Key metrics (fast computations)
+    # Key metrics
     col1, col2, col3, col4, col5, col6 = st.columns(6)
 
     with col1:
-        high_value_count = len(filtered_df[filtered_df["lead_score"] >= 8])
         st.metric(
             "Total Records",
             f"{len(filtered_df):,}",
-            delta=f"{high_value_count:,} high-value",
+            delta=f"{len(filtered_df[filtered_df['lead_score'] >= 8]):,} high-value",
         )
 
     with col2:
-        avg_members = filtered_df["num_org_mem"].mean() if len(filtered_df) > 0 else 0
+        avg_members = filtered_df["num_org_mem"].mean()
         st.metric(
             "Avg. Members",
             f"{avg_members:.1f}",
@@ -246,7 +324,10 @@ def main():
 
     with col3:
         unique_facilities = filtered_df["Facility Name"].nunique()
-        st.metric("Unique Facilities", f"{unique_facilities:,}")
+        st.metric(
+            "Unique Facilities",
+            f"{unique_facilities:,}",
+        )
 
     with col4:
         phone_count = filtered_df["has_phone"].sum()
@@ -293,16 +374,36 @@ def main():
             "Organizations ranked by member count with complete contact information"
         )
 
-        # Get top organizations with limit
-        org_groups = get_top_organizations(filtered_df, limit=2000)
+        # Group by facility and organization
+        org_groups = (
+            filtered_df.groupby(["Facility Name", "org_pac_id"])
+            .agg(
+                {
+                    "lead_score": "max",
+                    "num_org_mem": "first",
+                    "org_size_category": "first",
+                    "has_phone": "max",
+                    "state_clean": "first",
+                    "city_clean": "first",
+                    "phone_clean": "first",
+                    "full_address": "first",
+                    "pri_spec": lambda x: x.mode()[0] if not x.mode().empty else "Unknown",
+                    "NPI": "count",  # Count of providers
+                    "grp_assgn": "first",
+                    "Telehlth": "first",
+                }
+            )
+            .reset_index()
+            .sort_values(["num_org_mem", "lead_score"], ascending=False)
+        )
+
+        org_groups.rename(columns={"NPI": "provider_count"}, inplace=True)
 
         # Add pagination
         total_orgs = len(org_groups)
 
         if total_orgs > items_per_page:
-            total_pages = (total_orgs // items_per_page) + (
-                1 if total_orgs % items_per_page > 0 else 0
-            )
+            total_pages = (total_orgs // items_per_page) + (1 if total_orgs % items_per_page > 0 else 0)
 
             col_page, col_info = st.columns([1, 2])
             with col_page:
@@ -312,14 +413,12 @@ def main():
                     max_value=total_pages,
                     value=1,
                     step=1,
-                    key="org_page",
+                    key="org_page"
                 )
             with col_info:
                 start_idx = (page - 1) * items_per_page
                 end_idx = min(start_idx + items_per_page, total_orgs)
-                st.info(
-                    f"Showing {start_idx+1}-{end_idx} of {total_orgs:,} organizations (Page {page}/{total_pages})"
-                )
+                st.info(f"Showing {start_idx+1}-{end_idx} of {total_orgs:,} organizations (Page {page}/{total_pages})")
 
             org_groups_page = org_groups.iloc[start_idx:end_idx]
         else:
@@ -332,17 +431,13 @@ def main():
         for idx, (_, lead) in enumerate(org_groups_page.iterrows()):
             with col1 if idx % 2 == 0 else col2:
                 score_color = (
-                    "🟢" if lead["lead_score"] >= 10 else "🟡"
-                    if lead["lead_score"] >= 6
-                    else "🔵"
+                    "🟢"
+                    if lead["lead_score"] >= 10
+                    else "🟡" if lead["lead_score"] >= 6 else "🔵"
                 )
                 phone_icon = "📱" if lead["has_phone"] else "❌"
                 group_icon = "👥" if lead["grp_assgn"] == "Y" else ""
-                telehealth_icon = (
-                    "💻"
-                    if pd.notna(lead["Telehlth"]) and lead["Telehlth"] != ""
-                    else ""
-                )
+                telehealth_icon = "💻" if pd.notna(lead["Telehlth"]) and lead["Telehlth"] != "" else ""
 
                 with st.expander(
                     f"{score_color} **{lead['Facility Name'][:50]}** ({lead['num_org_mem']} members | {lead['provider_count']} providers) {phone_icon}{group_icon}{telehealth_icon}",
@@ -373,7 +468,7 @@ def main():
                     else:
                         st.write("**Phone:** Not available")
 
-                    st.write("**Email:** 🤖 Use Email Discovery Agent")
+                    st.write("**Email:** 🤖 Use Email Discovery Agent (see below)")
 
                     # Address information
                     st.markdown("### 📍 Address")
@@ -384,11 +479,11 @@ def main():
                         st.markdown("### 💻 Telehealth")
                         st.write(f"{lead['Telehlth']}")
 
-                    # Show providers at this organization (limit to 5 for performance)
+                    # Show providers at this organization
                     org_providers = filtered_df[
                         (filtered_df["Facility Name"] == lead["Facility Name"])
                         & (filtered_df["org_pac_id"] == lead["org_pac_id"])
-                    ].head(5)
+                    ].head(20)  # Limit to first 20 for performance
 
                     if len(org_providers) > 0:
                         st.markdown("### 👨‍⚕️ Sample Providers")
@@ -397,12 +492,12 @@ def main():
                             if provider["Cred"]:
                                 provider_info += f", {provider['Cred']}"
                             provider_info += f" - {provider['pri_spec']}"
+                            if provider["sec_spec_all"]:
+                                provider_info += f" (Also: {provider['sec_spec_all'][:50]})"
                             st.write(provider_info)
 
-                        if lead["provider_count"] > 5:
-                            st.write(
-                                f"_...and {lead['provider_count'] - 5} more providers_"
-                            )
+                        if lead["provider_count"] > 20:
+                            st.write(f"_...and {lead['provider_count'] - 20} more providers_")
 
     with tab2:
         st.header("Individual Provider Details")
@@ -416,16 +511,10 @@ def main():
         search_df = filtered_df.copy()
         if search_term:
             mask = (
-                search_df["provider_full_name"].str.contains(
-                    search_term, case=False, na=False
-                )
-                | search_df["Facility Name"].str.contains(
-                    search_term, case=False, na=False
-                )
+                search_df["provider_full_name"].str.contains(search_term, case=False, na=False)
+                | search_df["Facility Name"].str.contains(search_term, case=False, na=False)
                 | search_df["pri_spec"].str.contains(search_term, case=False, na=False)
-                | search_df["city_clean"].str.contains(
-                    search_term, case=False, na=False
-                )
+                | search_df["city_clean"].str.contains(search_term, case=False, na=False)
             )
             search_df = search_df[mask]
 
@@ -462,9 +551,7 @@ def main():
         total_items = len(display_df)
 
         if total_items > providers_per_page:
-            total_pages = (total_items // providers_per_page) + (
-                1 if total_items % providers_per_page > 0 else 0
-            )
+            total_pages = (total_items // providers_per_page) + (1 if total_items % providers_per_page > 0 else 0)
 
             col_page, col_info = st.columns([1, 2])
             with col_page:
@@ -479,9 +566,7 @@ def main():
             with col_info:
                 start_idx = (page_num - 1) * providers_per_page
                 end_idx = min(start_idx + providers_per_page, total_items)
-                st.info(
-                    f"Showing {start_idx+1}-{end_idx} of {total_items:,} providers (Page {page_num}/{total_pages})"
-                )
+                st.info(f"Showing {start_idx+1}-{end_idx} of {total_items:,} providers (Page {page_num}/{total_pages})")
 
             display_page = display_df.iloc[start_idx:end_idx]
         else:
@@ -491,31 +576,22 @@ def main():
         st.dataframe(
             display_page,
             use_container_width=True,
-            height=400,  # Reduced from 600
+            height=600,
             column_config={
                 "Org Members": st.column_config.NumberColumn("Org Members", format="%d"),
-                "Graduation Year": st.column_config.NumberColumn(
-                    "Grad Year", format="%d"
-                ),
+                "Graduation Year": st.column_config.NumberColumn("Grad Year", format="%d"),
             },
         )
 
     with tab3:
         st.header("Organization & Provider Analytics")
 
-        # LAZY LOADING: Only compute when tab is active
-        if "tab3_loaded" not in st.session_state:
-            st.session_state.tab3_loaded = True
-
         col1, col2 = st.columns(2)
 
         with col1:
-            # Organization size distribution (limit to prevent huge aggregations)
-            sample_size = min(len(filtered_df), 50000)
-            sample_df = filtered_df.head(sample_size)
-
+            # Organization size distribution
             size_dist = (
-                sample_df.groupby("org_size_category")
+                filtered_df.groupby("org_size_category")
                 .agg({"num_org_mem": ["count", "sum"]})
                 .reset_index()
             )
@@ -525,7 +601,7 @@ def main():
                 size_dist,
                 x="Category",
                 y="Provider Count",
-                title=f"Providers by Organization Size (Top {sample_size:,})",
+                title="Providers by Organization Size Category",
                 text="Provider Count",
                 color="Total Members",
                 color_continuous_scale="Blues",
@@ -536,10 +612,11 @@ def main():
 
         with col2:
             # Top specialties
-            specialty_counts = sample_df["pri_spec"].value_counts().head(15)
-            specialty_df = pd.DataFrame(
-                {"Specialty": specialty_counts.index, "Count": specialty_counts.values}
-            )
+            specialty_counts = filtered_df["pri_spec"].value_counts().head(15)
+            specialty_df = pd.DataFrame({
+                'Specialty': specialty_counts.index,
+                'Count': specialty_counts.values
+            })
             fig = px.bar(
                 specialty_df,
                 x="Count",
@@ -552,7 +629,7 @@ def main():
         # Top facilities by member count
         st.subheader("Largest Healthcare Organizations")
         top_facilities = (
-            sample_df.groupby("Facility Name")
+            filtered_df.groupby("Facility Name")
             .agg(
                 {
                     "num_org_mem": "first",
@@ -577,17 +654,13 @@ def main():
         top_facilities["Contact"] = top_facilities["Has Phone"].apply(
             lambda x: "📱" if x else "❌"
         )
-        display_facilities = top_facilities[
-            ["Facility", "Members", "Providers", "City", "State", "Contact"]
-        ]
-        st.dataframe(
-            display_facilities, hide_index=True, use_container_width=True, height=300
-        )
+        display_facilities = top_facilities[["Facility", "Members", "Providers", "City", "State", "Contact"]]
+        st.dataframe(display_facilities, hide_index=True, use_container_width=True, height=400)
 
         # Gender distribution
         col3, col4 = st.columns(2)
         with col3:
-            gender_dist = sample_df["gndr"].value_counts()
+            gender_dist = filtered_df["gndr"].value_counts()
             fig = px.pie(
                 values=gender_dist.values,
                 names=gender_dist.index,
@@ -597,14 +670,11 @@ def main():
 
         with col4:
             # Graduation year distribution (for recent grads)
-            grad_years = (
-                sample_df[sample_df["Grd_yr"] >= 2000]["Grd_yr"]
-                .value_counts()
-                .sort_index()
-            )
-            grad_years_df = pd.DataFrame(
-                {"Year": grad_years.index, "Count": grad_years.values}
-            )
+            grad_years = filtered_df[filtered_df["Grd_yr"] >= 2000]["Grd_yr"].value_counts().sort_index()
+            grad_years_df = pd.DataFrame({
+                'Year': grad_years.index,
+                'Count': grad_years.values
+            })
             fig = px.line(
                 grad_years_df,
                 x="Year",
@@ -616,17 +686,9 @@ def main():
     with tab4:
         st.header("Territory Analysis")
 
-        # LAZY LOADING
-        if "tab4_loaded" not in st.session_state:
-            st.session_state.tab4_loaded = True
-
-        # Limit data for territory analysis
-        sample_size = min(len(filtered_df), 50000)
-        sample_df = filtered_df.head(sample_size)
-
         # State-level metrics
         state_metrics = (
-            sample_df.groupby("state_clean")
+            filtered_df.groupby("state_clean")
             .agg(
                 {
                     "num_org_mem": ["sum", "mean"],
@@ -656,7 +718,7 @@ def main():
                 state_metrics.reset_index(),
                 x="state_clean",
                 y="Total Members",
-                title=f"Total Organization Members by State (Top 25, Sample: {sample_size:,})",
+                title="Total Organization Members by State (Top 25)",
                 text="Total Members",
                 color="Providers",
                 color_continuous_scale="Viridis",
@@ -671,7 +733,7 @@ def main():
         # City analysis
         st.subheader("Top Cities by Provider Count")
         city_metrics = (
-            sample_df.groupby(["city_clean", "state_clean"])
+            filtered_df.groupby(["city_clean", "state_clean"])
             .agg(
                 {
                     "NPI": "count",
@@ -690,9 +752,7 @@ def main():
             "With Phone",
         ]
         city_metrics = city_metrics.reset_index()
-        city_metrics["Location"] = (
-            city_metrics["city_clean"] + ", " + city_metrics["state_clean"]
-        )
+        city_metrics["Location"] = city_metrics["city_clean"] + ", " + city_metrics["state_clean"]
 
         fig = px.bar(
             city_metrics,
@@ -709,12 +769,11 @@ def main():
     with tab5:
         st.header("Export Contact List")
         st.markdown(
-            "Download filtered data for outreach. **Note:** Emails not included in CMS data."
+            "Download filtered data for outreach. **Note:** Emails not included in CMS data - use Email Discovery Agent below."
         )
 
-        # Prepare export data (limit to prevent huge exports)
-        export_limit = min(len(filtered_df), 100000)
-        export_df = filtered_df.head(export_limit)[
+        # Prepare export data
+        export_df = filtered_df[
             [
                 "Facility Name",
                 "org_pac_id",
@@ -765,11 +824,6 @@ def main():
             "Graduation_Year",
             "Telehealth",
         ]
-
-        if len(filtered_df) > export_limit:
-            st.warning(
-                f"⚠️ Export limited to top {export_limit:,} records (of {len(filtered_df):,} total) for performance"
-            )
 
         # Show preview
         st.subheader("Export Preview")
@@ -836,6 +890,23 @@ def main():
                 mime="text/csv",
                 help="Organizations with 100+ members",
             )
+
+        # Email Discovery Agent Section
+        st.divider()
+        st.subheader("🤖 Email Discovery Agent")
+        st.markdown("""
+        **Note:** The CMS DAC dataset does not include email addresses. To find emails for your leads,
+        you'll need to use the Email Discovery Agent (see implementation details below).
+
+        The agent will:
+        1. Take facility names and addresses as input
+        2. Search for organization websites
+        3. Find contact pages and staff directories
+        4. Extract email patterns and specific contact emails
+        5. Return results in a structured format
+
+        **See the `email_agent.py` file for the implementation.**
+        """)
 
 
 if __name__ == "__main__":
