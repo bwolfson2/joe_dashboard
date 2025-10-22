@@ -44,12 +44,41 @@ st.markdown(
 @st.cache_data(ttl=3600)
 def load_preprocessed_data():
     """Load preprocessed data - NO expensive operations here"""
+    import os
+    import subprocess
+
+    data_file = "data/preprocessed_dashboard_data.parquet"
+
+    # Check if preprocessed data exists
+    if not os.path.exists(data_file):
+        st.warning("⚠️ Preprocessed data not found. Running preprocessing (this may take 2-3 minutes)...")
+
+        # Try to run preprocessing automatically
+        try:
+            with st.spinner("Preprocessing data... This only happens once."):
+                result = subprocess.run(
+                    ["python", "scripts/01_data_preparation/preprocess_for_dashboard.py"],
+                    capture_output=True,
+                    text=True,
+                    timeout=300
+                )
+
+                if result.returncode == 0:
+                    st.success("✅ Preprocessing complete! Loading dashboard...")
+                else:
+                    st.error(f"❌ Preprocessing failed: {result.stderr}")
+                    return pd.DataFrame()
+        except Exception as e:
+            st.error(f"❌ Could not run preprocessing: {e}")
+            st.info("Please run manually: `python scripts/01_data_preparation/preprocess_for_dashboard.py`")
+            return pd.DataFrame()
+
+    # Load the preprocessed data
     try:
-        df = pd.read_parquet("data/preprocessed_dashboard_data.parquet")
+        df = pd.read_parquet(data_file)
         return df
-    except FileNotFoundError:
-        st.error("❌ Preprocessed data not found!")
-        st.info("Run: `python scripts/01_data_preparation/preprocess_for_dashboard.py`")
+    except Exception as e:
+        st.error(f"❌ Error loading data: {e}")
         return pd.DataFrame()
 
 
